@@ -5,11 +5,9 @@ from collections import defaultdict
 import statistics
 
 # Configuration
-PCAP_FILE = "traffic.pcap"
-TIME_WINDOW = 1          # seconds per window
-SPIKE_THRESHOLD = 2.0    # multiplier for anomaly detection
+TIME_WINDOW = 1
+SPIKE_THRESHOLD = 2.5
 
-# Port to protocol mapping for classification
 PORT_MAP = {
     20: "FTP", 21: "FTP",
     22: "SSH",
@@ -27,9 +25,8 @@ PORT_MAP = {
     8443: "HTTPS-Alt",
 }
 
-# classifcation function
+
 def classify(pkt):
-    """Classify packet based on TCP/UDP ports"""
     if pkt.haslayer(TCP):
         sport, dport = pkt[TCP].sport, pkt[TCP].dport
         for port in (dport, sport):
@@ -47,209 +44,195 @@ def classify(pkt):
 
     return "Non-TCP/UDP"
 
-# Read packets from pcap file
-packets = rdpcap(PCAP_FILE)
 
-# 1. Traffic classification
-stats = {}
-for pkt in packets:
-    label = classify(pkt)
-    stats[label] = stats.get(label, 0) + 1
+def analyze(pcap_file, output_dir="plots"):
+    if not os.path.exists(pcap_file):
+        print(f"[ERROR] File not found: {pcap_file}")
+        return {"total": 0, "anomalies": [], "report_path": None}
 
-total = sum(stats.values())
+    packets = rdpcap(pcap_file)
 
-print("\n=== Traffic Classification ===")
-for proto, count in sorted(stats.items(), key=lambda x: -x[1]):
-    print(f"{proto:15s}: {count:6d}  ({count / total * 100:.2f}%)")
+    if len(packets) == 0:
+        print("Empty pcap file, nothing to analyze.")
+        return {"total": 0, "anomalies": [], "report_path": None}
 
-# 2. classification distribution
-THRESHOLD = 0.02
-filtered = {}
-other_misc = 0
+    # 1. Traffic classification
+    stats = {}
+    for pkt in packets:
+        label = classify(pkt)
+        stats[label] = stats.get(label, 0) + 1
 
-# Merge small categories
-for k, v in stats.items():
-    if v / total < THRESHOLD:
-        other_misc += v
-    else:
-        filtered[k] = v
+    total = sum(stats.values())
 
-if other_misc:
-    filtered["Other (misc)"] = other_misc
+    print("\n=== Traffic Classification ===")
+    for proto, count in sorted(stats.items(), key=lambda x: -x[1]):
+        print(f"{proto:15s}: {count:6d}  ({count / total * 100:.2f}%)")
 
-labels = list(filtered.keys())
-sizes = list(filtered.values())
+    # 2. classification distribution
+    THRESHOLD = 0.02
+    filtered = {}
+    other_misc = 0
 
-COLORS = {
-    "HTTPS": "#378ADD",
-    "HTTP": "#1D9E75",
-    "DNS": "#EF9F27",
-    "SSH": "#7F77DD",
-    "FTP": "#D85A30",
-    "SMTP": "#D4537E",
-    "RDP": "#639922",
-    "QUIC/HTTP3": "#5DCAA5",
-    "Other TCP": "#888780",
-    "Other UDP": "#B4B2A9",
-    "Other (misc)": "#D3D1C7",
-}
+    for k, v in stats.items():
+        if v / total < THRESHOLD:
+            other_misc += v
+        else:
+            filtered[k] = v
 
-colors = [COLORS.get(l, "#CCCCCC") for l in labels]
+    if other_misc:
+        filtered["Other (misc)"] = other_misc
 
-plt.figure(figsize=(8, 6))
-wedges, _, autotexts = plt.pie(
-    sizes,
-    colors=colors,
-    autopct=lambda p: f"{p:.1f}%" if p >= 2 else "",
-    startangle=140,
-    wedgeprops=dict(edgecolor="white"),
-)
+    labels = list(filtered.keys())
+    sizes = list(filtered.values())
 
-legend_labels = [
-    f"{l} ({filtered[l]:,}, {filtered[l]/total*100:.1f}%)"
-    for l in labels
-]
+    COLORS = {
+        "HTTPS": "#378ADD",
+        "HTTP": "#1D9E75",
+        "DNS": "#EF9F27",
+        "SSH": "#7F77DD",
+        "FTP": "#D85A30",
+        "SMTP": "#D4537E",
+        "RDP": "#639922",
+        "QUIC/HTTP3": "#5DCAA5",
+        "Other TCP": "#888780",
+        "Other UDP": "#B4B2A9",
+        "Other (misc)": "#D3D1C7",
+    }
 
-plt.legend(
-    wedges,
-    legend_labels,
-    title="Protocol",
-    loc="center left",
-    bbox_to_anchor=(1, 0.5)
-)
+    colors = [COLORS.get(l, "#CCCCCC") for l in labels]
 
-plt.title("Traffic Classification Distribution")
-plt.tight_layout()
+    plt.figure(figsize=(8, 6))
+    wedges, _, autotexts = plt.pie(
+        sizes,
+        colors=colors,
+        autopct=lambda p: f"{p:.1f}%" if p >= 2 else "",
+        startangle=140,
+        wedgeprops=dict(edgecolor="white"),
+    )
 
-os.makedirs("plots", exist_ok=True)
-plt.savefig("plots/pie_chart.png", dpi=150)
-plt.show()
-plt.close()
+    legend_labels = [
+        f"{l} ({filtered[l]:,}, {filtered[l]/total*100:.1f}%)"
+        for l in labels
+    ]
 
-print("classification distribution saved: plots/pie_chart.png")
+    plt.legend(
+        wedges,
+        legend_labels,
+        title="Protocol",
+        loc="center left",
+        bbox_to_anchor=(1, 0.5)
+    )
 
-# 3. Time-based analysis
-time_buckets = defaultdict(int)
+    plt.title("Traffic Classification Distribution")
+    plt.tight_layout()
 
-start_time = packets[0].time
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(os.path.join(output_dir, "pie_chart.png"), dpi=150)
+    plt.show()
+    plt.close()
 
-for pkt in packets:
-    t = int((pkt.time - start_time) // TIME_WINDOW)
-    time_buckets[t] += 1
+    print("classification distribution saved")
 
-counts = list(time_buckets.values())
+    # 3. Time-based analysis
+    time_buckets = defaultdict(int)
+    start_time = packets[0].time
 
-# 4. Anomaly detection using z-score
-mean = statistics.mean(counts)
-std = statistics.stdev(counts) if len(counts) > 1 else 0
+    for pkt in packets:
+        t = int((pkt.time - start_time) // TIME_WINDOW)
+        time_buckets[t] += 1
 
-print("\n=== Anomaly Detection ===")
-anomalies = []
+    counts = [time_buckets[t] for t in sorted(time_buckets.keys())]
 
-for t, count in time_buckets.items():
-    z = (count - mean) / std if std > 0 else 0
-    if z > 3:
-        anomalies.append((t, count))
-        print(f"[ALERT] Spike at window {t}: {count} packets (z={z:.2f})")
+    # 4. Anomaly detection
+    mean = statistics.mean(counts)
+    std = statistics.stdev(counts) if len(counts) > 1 else 0
 
-if not anomalies:
-    print("No anomalies detected.")
+    print("\n=== Anomaly Detection ===")
+    anomalies = []
 
-# 5. Time series plot
-plt.figure(figsize=(10, 4))
-plt.plot(time_buckets.keys(), time_buckets.values(), marker='o')
-plt.axhline(mean, linestyle='--')
-plt.title("Traffic Over Time (Packets per Window)")
-plt.xlabel("Time Window")
-plt.ylabel("Packets")
-plt.tight_layout()
+    for t in sorted(time_buckets.keys()):
+        count = time_buckets[t]
+        z = (count - mean) / std if std > 0 else 0
+        if z > SPIKE_THRESHOLD:
+            anomalies.append((t, count, z))
+            print(f"[ALERT] Spike at window {t}: {count} packets (z={z:.2f})")
 
-plt.savefig("plots/time_series.png", dpi=150)
-plt.show()
-plt.close()
+    if not anomalies:
+        print("No anomalies detected.")
 
-print("Time series saved: plots/time_series.png")
+    # 5. Time series plot
+    plt.figure(figsize=(10, 4))
+    plt.plot(time_buckets.keys(), time_buckets.values(), marker='o', label='Traffic')
+    plt.axhline(mean, linestyle='--', color='orange', label='Mean')
+    if anomalies:
+        x_vals = [t for t, _, _ in anomalies]
+        y_vals = [c for _, c, _ in anomalies]
+        plt.scatter(x_vals, y_vals, color='red', s=80, zorder=5, label='Anomaly')
+    plt.title("Traffic Over Time (Packets per Window)")
+    plt.xlabel("Time Window")
+    plt.ylabel("Packets")
+    plt.tight_layout()
 
-# 6. HTML report generation
-status = "Anomaly Detected" if anomalies else "Normal"
+    plt.savefig(os.path.join(output_dir, "time_series.png"), dpi=150)
+    plt.show()
+    plt.close()
 
-html = f"""
+    print("Time series saved")
+
+    # 6. HTML report
+    status = "Anomaly Detected" if anomalies else "Normal"
+
+    html = f"""
 <html>
 <head>
 <title>Traffic Analysis Report</title>
-
-<style>
-body {{
-    font-family: Arial;
-    margin: 40px;
-}}
-h1 {{
-    color: #333;
-}}
-.section {{
-    margin-top: 30px;
-}}
-.alert {{
-    color: red;
-    font-weight: bold;
-}}
-</style>
-
 </head>
 <body>
 
 <h1>Network Traffic Report</h1>
 
-<div class="section">
 <h2>Summary</h2>
 <p>Total Packets: {total}</p>
 <p><b>Status:</b> {status}</p>
-</div>
 
-<div class="section">
 <h2>Protocol Distribution</h2>
 <ul>
 """
 
-# Protocol stats
-for proto, count in stats.items():
-    html += f"<li>{proto}: {count} ({count/total*100:.2f}%)</li>"
+    for proto, count in stats.items():
+        html += f"<li>{proto}: {count} ({count/total*100:.2f}%)</li>"
 
-# Add classification distribution
-html += """
+    html += """
 </ul>
-<h3>classification distribution Visualization</h3>
 <img src="pie_chart.png" width="600">
-</div>
 """
 
-# Anomaly section
-html += "<div class='section'><h2>Anomaly Detection</h2>"
+    html += "<h2>Anomaly Detection</h2>"
 
-if anomalies:
-    html += "<ul>"
-    for t, c in anomalies:
-        html += f"<li class='alert'>Spike at window {t}: {c} packets</li>"
-    html += "</ul>"
-else:
-    html += "<p>No anomalies detected</p>"
+    if anomalies:
+        html += "<ul>"
+        for t, c, z in anomalies:
+            html += f"<li>Spike at window {t}: {c} packets (z={z:.2f})</li>"
+        html += "</ul>"
+    else:
+        html += "<p>No anomalies detected</p>"
 
-html += "</div>"
-
-# Time series
-html += """
-<div class="section">
+    html += """
 <h2>Time-Based Analysis</h2>
-<h3>Traffic Over Time</h3>
 <img src="time_series.png" width="600">
-</div>
 
 </body>
 </html>
 """
 
-# Save report
-with open("plots/report.html", "w") as f:
-    f.write(html)
+    report_path = os.path.join(output_dir, "report.html")
+    with open(report_path, "w") as f:
+        f.write(html)
 
-print("\nReport generated: plots/report.html")
+    print(f"\nReport generated: {report_path}")
+
+    return {
+        "total": total,
+        "anomalies": anomalies,
+        "report_path": report_path
+    }
